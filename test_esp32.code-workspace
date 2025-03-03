@@ -1,0 +1,28 @@
+{
+	"folders": [
+		{
+			"name": "test_esp32",
+			"path": "../../OneDrive/Documents/PlatformIO/Projects/test_esp32"
+		},
+		{
+			"name": "car_ctrl_uhf_ESP32",
+			"path": "."
+		},
+		{
+			"name": "vehicle_ctrl_uhf",
+			"path": "../vehicle_ctrl_uhf"
+		},
+		{
+			"name": "tx_syn115_8266",
+			"path": "../tx_syn115_8266"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"chrono": "cpp",
+			"thread": "cpp",
+			"string_view": "cpp",
+			"regex": "cpp"
+		}
+	}
+}
