@@ -2,7 +2,7 @@
 #include <string>
 // UHF
 #include <RH_ASK.h>
-#include <SPI.h> // Not actualy used but needed to compile
+#include <SPI.h> // Not actually used but needed to compile
 
 // WIFI
 #include <WiFi.h>
@@ -12,17 +12,18 @@
 // MQTT
 #include <PubSubClient.h>
 #define MSG_BUFFER_SIZE (50)
-// Update these with values suitable for your network.
 
+// Update these with values suitable for your network.
 // version
 #define MAYOR 1
 #define MINOR 0
-#define PATCH 0
+#define PATCH 1
 String version = String(MAYOR) + "." + String(MINOR) + "." + String(PATCH);
+
 // WIFI PASSWORD
 #define WIFI_SSID "MIWIFI_zmiz"
 #define WIFI_PASS "3wRdPJut"
-//  put function declarations here:
+
 // LED DISPLAY
 const int led1 = 2; // Pin of the LED
 const int D15 = 15; // output car control
@@ -31,27 +32,27 @@ const int D16 = 16; // TX output car control
 const int D17 = 17; // PPT output car control
 bool state = 1;
 bool state2 = 1;
+
 // MAIN LOOP
 volatile uint32_t lastMillis = 0;
-
+volatile uint32_t biggerTimeMillis = 0;
 // MQTT
-#define MSG_BUFFER_SIZE (50)
 char msg[MSG_BUFFER_SIZE];
-std::string device = "car_mod";
+std::string device = "car/command";
 std::string TOPIC_IP = "home/" + device;
-const char *mqtt_server = "192.168.1.2";
+const char *mqtt_server = "192.168.1.3";
 const char *TOPIC = TOPIC_IP.c_str();
 WiFiClient espClient;
 PubSubClient client(espClient);
 unsigned long lastMsg = 0;
-// MQTT
+
+// MQTT function declarations
 void callback_mqtt(char *topic, byte *payload, unsigned int length);
 void reconnect_mqtt();
 
 // APP
 #define END_CODE 4
 #define FORWARD 10
-// #define FORWARD 16
 #define TURBO 22
 #define FORWARD_LEFT 28
 #define FORWARD_RIGHT 34
@@ -60,6 +61,7 @@ void reconnect_mqtt();
 #define BACKWARD_LEFT 52
 #define LEFT 58
 #define RIGHT 64
+
 uint8_t commands_test[] = {FORWARD, FORWARD_LEFT, FORWARD_RIGHT, BACKWARD, BACKWARD_RIGHT, BACKWARD_LEFT, LEFT, RIGHT};
 uint8_t ite = 0;
 uint8_t cmd = 0;
@@ -67,6 +69,7 @@ unsigned long lastMicro = 0; // main timer
 unsigned long lastMicro_send = 0;
 bool forward = true;
 bool w1 = 1; // Initialize w1
+
 enum State
 {
   IDLE,
@@ -98,11 +101,12 @@ uint8_t buflen = sizeof(uhf_buf);
 RH_ASK driver(9600, D4, D16, D17);
 bool recv_flag = false;
 void UHF_recv(void *parameter);
+void car_signal_task(void *parameter);
 
 void setup()
 {
   pinMode(led1, OUTPUT);
-  pinMode(D4, OUTPUT);  // RX
+  pinMode(D4, INPUT);   // RX
   pinMode(D17, OUTPUT); // TX
   pinMode(D15, OUTPUT); // PPT
   Serial.begin(115200);
@@ -115,52 +119,73 @@ void setup()
 
   // WIFI
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS); // change it to your ussid and password
+  WiFi.begin(WIFI_SSID, WIFI_PASS); // change it to your SSID and password
   while (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
     Serial.println("Connection Failed! Rebooting...");
     delay(5000);
   }
-  Serial.printf("[WIFI] STATION Mode, SSID: %s, IP address: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  // MULTUTASK
-  xTaskCreate(mqtt_service, "MQTT Service", 2000, NULL, 1, NULL);
 
-  xTaskCreate(UHF_recv, "UHF Receiver", 2000, NULL, 10, NULL);
+  Serial.printf("[WIFI] STATION Mode, SSID: %s, IP address: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+  // MULTITASK
+  xTaskCreate(mqtt_service, "MQTT Service", 4096, NULL, 5, NULL);
+  xTaskCreate(car_signal_task, "Car Signal Task", 2048, NULL, 4, NULL); // Create the new task
+  // xTaskCreate(UHF_recv, "UHF Receiver", 2000, NULL, 10, NULL);
 }
 
 void loop()
 {
-  //-----------------------
-  for (size_t i = 0; i < 4; i++)
-  {
-    digitalWrite(D15, 0);
-    wait_us(400);
-    wait_us(400);
-    wait_us(400);
-    digitalWrite(D15, 1);
-    wait_us(620);
-    digitalWrite(D15, 0); // next w1
-    wait_us(320);
-  }
-  uint8_t code = ((cmd * 2));
+  vTaskDelay(100); // Just yield if loop() must exist
+}
 
-  for (size_t i = 0; i < code; i++)
+// Car signal task
+
+void car_signal_task(void *parameter)
+{
+  for (;;)
   {
-    digitalWrite(D15, w1);
-    if (i < (code - 1) && w1 == 1)
-      wait_us(620);
-    if (i == (code - 1) && w1 == 1)
+    //-----------------------
+    for (size_t i = 0; i < 4; i++)
     {
+      digitalWrite(D15, 0);
+      wait_us(400);
+      wait_us(400);
+      wait_us(400);
+      digitalWrite(D15, 1);
       wait_us(620);
-      break;
-    }
-    if (w1 == 0)
+      digitalWrite(D15, 0); // next w1
       wait_us(320);
-    w1 = !w1;
+    }
+    uint8_t code = ((cmd * 2));
+
+    for (size_t i = 0; i < code; i++)
+    {
+      digitalWrite(D15, w1);
+      if (i < (code - 1) && w1 == 1)
+        wait_us(620);
+      if (i == (code - 1) && w1 == 1)
+      {
+        wait_us(620);
+        break;
+      }
+      if (w1 == 0)
+        wait_us(320);
+      w1 = !w1;
+    }
   }
 }
-// ENDOFCODE
-//------------------------
+void wait_us(uint64_t number_of_microseconds)
+{
+  uint64_t microseconds = esp_timer_get_time();
+  if (0 != number_of_microseconds)
+  {
+    while (((uint64_t)esp_timer_get_time() - microseconds) <= number_of_microseconds)
+    {
+      // Wait - THIS HOGS CPU
+    }
+  }
+}
 // UHF
 void UHF_recv(void *parameter)
 {
@@ -182,6 +207,7 @@ void UHF_recv(void *parameter)
     yield();
   }
 }
+
 // MQTT
 void mqtt_service(void *parameter)
 {
@@ -189,7 +215,6 @@ void mqtt_service(void *parameter)
   client.setCallback(callback_mqtt);
   for (;;)
   {
-
     if (!client.connected())
     {
       reconnect_mqtt();
@@ -197,23 +222,28 @@ void mqtt_service(void *parameter)
     else
     {
       client.loop();
-
-      if (millis() - lastMillis >= 10000)
+      if (millis() - lastMillis >= 1000)
       {
         lastMillis = millis();
+        digitalWrite(led1, state);
+        state = !state;
+      }
 
-        /*cmd = commands_test[ite];
+      if (millis() - biggerTimeMillis >= 10000)
+      {
+        biggerTimeMillis = millis();
+
+        cmd = commands_test[ite];
         // cmd = 10;
         ite++;
         if (ite >= sizeof(commands_test))
           ite = 0;
         Serial.printf("CMD: %d\n", cmd);
-        */
         digitalWrite(led1, state);
         state = !state;
         // Serial.printf("[WIFI] STATION Mode, SSID: %s, IP address: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-        snprintf(msg, MSG_BUFFER_SIZE, "%s:%s", device.c_str(), WiFi.localIP().toString().c_str());
-        client.publish(TOPIC_IP.c_str(), msg);
+        // snprintf(msg, MSG_BUFFER_SIZE, "%s:%s", device.c_str(), WiFi.localIP().toString().c_str());
+        // client.publish(TOPIC_IP.c_str(), msg);
       }
     }
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -221,22 +251,9 @@ void mqtt_service(void *parameter)
   }
 }
 
-void wait_us(uint64_t number_of_microseconds)
-{
-  uint64_t microseconds = esp_timer_get_time();
-  if (0 != number_of_microseconds)
-  {
-    while (((uint64_t)esp_timer_get_time() - microseconds) <=
-           number_of_microseconds)
-    {
-      // Wait
-    }
-  }
-}
 // MQTT
 void callback_mqtt(char *topic, byte *payload, unsigned int length)
 {
-
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
