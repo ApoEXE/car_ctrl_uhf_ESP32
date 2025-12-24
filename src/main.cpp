@@ -1,23 +1,22 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// --- Network Configuration ---
+// --- Configuration ---
 const char *ssid = "Livebox7-1EF4";
 const char *password = "gWL6vK3ztUNG";
 const char *mqtt_server = "192.168.1.2";
 const char *mqtt_topic = "home/car/command";
 
-// --- Hardware Pins ---
-#define SIGNAL_PIN 15 // D15 connected to RX-2C SI Pin
-#define STATUS_LED 2  // Built-in LED
+#define SI_PIN 15 // Signal Injection Pin
+#define STATUS_LED 2
 
-// --- Variables ---
-volatile int current_cmd = 0; // Command shared between cores
+// --- Shared Variables ---
+volatile int current_cmd = 0;
 WiFiClient espClient;
 PubSubClient client(espClient);
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- MQTT Callback: Receives commands from publisher ---
+// --- MQTT Callback ---
 void callback(char *topic, byte *payload, unsigned int length)
 {
   char message[16];
@@ -25,94 +24,99 @@ void callback(char *topic, byte *payload, unsigned int length)
   {
     memcpy(message, payload, length);
     message[length] = '\0';
-    current_cmd = atoi(message); // Update command globally
-    Serial.print("MQTT Command Received: ");
+    current_cmd = atoi(message);
+    Serial.print("New Command: ");
     Serial.println(current_cmd);
   }
 }
 
-// --- RX-2C Protocol Logic (High Precision Timing) ---
-void send_rx2c_signal(int cmd)
+// --- SIGNAL GENERATION (Using your validated timing) ---
+void send_validated_signal(int cmd)
 {
   if (cmd <= 0)
     return;
 
-  // Enter Critical Section: Disables interrupts on this core to prevent jitter
+  // Disabling interrupts on this core for microsecond precision
   portENTER_CRITICAL(&timerMux);
 
-  // 1. Send 4 W2 (Start/Sync) Pulses
-  // W2 = 1.5ms (1500us) High, 0.5ms (500us) Low
+  // 1. PREAMBLE (W2 Sequence) - Repeated 4 times
+  // Timing from your working code: LOW 1440us, HIGH 680us
   for (int i = 0; i < 4; i++)
   {
-    digitalWrite(SIGNAL_PIN, HIGH);
-    ets_delay_us(1500);
-    digitalWrite(SIGNAL_PIN, LOW);
-    ets_delay_us(500);
+    digitalWrite(SI_PIN, LOW);
+    ets_delay_us(1440);
+    digitalWrite(SI_PIN, HIGH);
+    ets_delay_us(680);
   }
 
-  // 2. Send 'n' W1 (Data) Pulses
-  // W1 = 0.5ms (500us) High, 0.5ms (500us) Low
+  // 2. DATA COMMAND (W1 Sequence)
+  // Logic: Low 320us, High 660us (Last pulse High 460us)
   for (int i = 0; i < cmd; i++)
   {
-    digitalWrite(SIGNAL_PIN, HIGH);
-    ets_delay_us(500);
-    digitalWrite(SIGNAL_PIN, LOW);
-    ets_delay_us(500);
+    // LOW Phase
+    digitalWrite(SI_PIN, LOW);
+    ets_delay_us(320);
+
+    // HIGH Phase
+    digitalWrite(SI_PIN, HIGH);
+    if (i < (cmd - 1))
+    {
+      ets_delay_us(660); // Normal High
+    }
+    else
+    {
+      ets_delay_us(460); // Shorter final High
+    }
   }
 
-  // Exit Critical Section
-  portEXIT_CRITICAL(&timerMux);
+  // 3. Packet Gap (from your working code)
+  digitalWrite(SI_PIN, LOW);
+  ets_delay_us(100);
 
-  // 3. Dead Time (Blanking) - Crucial for RX-2C to latch the count
-  // This part does NOT need a critical section.
-  vTaskDelay(pdMS_TO_TICKS(15));
+  portEXIT_CRITICAL(&timerMux);
 }
 
-// --- CORE 1 TASK: High-Speed Signal Generation ---
+// --- CORE 1: Dedicated to Signal Timing ---
 void signalTask(void *pvParameters)
 {
-  pinMode(SIGNAL_PIN, OUTPUT);
-  digitalWrite(SIGNAL_PIN, LOW);
-
+  pinMode(SI_PIN, OUTPUT);
+  digitalWrite(SI_PIN, LOW);
   for (;;)
   {
     if (current_cmd > 0)
     {
-      send_rx2c_signal(current_cmd);
+      send_validated_signal(current_cmd);
     }
     else
     {
-      vTaskDelay(pdMS_TO_TICKS(50)); // Idle if no command
+      vTaskDelay(pdMS_TO_TICKS(50)); // Idle
     }
   }
 }
 
-// --- CORE 0 TASK: WiFi and MQTT Management ---
+// --- CORE 0: Dedicated to MQTT & WiFi ---
 void networkTask(void *pvParameters)
 {
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-
   for (;;)
   {
     if (!client.connected())
     {
-      Serial.print("Connecting to MQTT...");
-      String clientId = "ESP32_Car_Client_" + String(random(0xffff), HEX);
-      if (client.connect(clientId.c_str()))
+      Serial.print("Connecting MQTT...");
+      String cid = "ESP32_Car_" + String(random(0xffff), HEX);
+      if (client.connect(cid.c_str()))
       {
-        Serial.println("Connected!");
+        Serial.println("OK");
         client.subscribe(mqtt_topic);
       }
       else
       {
-        Serial.print("Failed, rc=");
-        Serial.println(client.state());
         vTaskDelay(pdMS_TO_TICKS(5000));
       }
     }
     client.loop();
-    vTaskDelay(pdMS_TO_TICKS(10)); // Yield for background WiFi tasks
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -121,28 +125,22 @@ void setup()
   Serial.begin(115200);
   pinMode(STATUS_LED, OUTPUT);
 
-  // Connect to WiFi
-  Serial.printf("Connecting to %s", ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
-    Serial.print(".");
     digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    Serial.print(".");
   }
-  Serial.println("\nWiFi Connected!");
+  Serial.println("\nWiFi Ready.");
   digitalWrite(STATUS_LED, HIGH);
 
-  // Create tasks on separate cores
-  // Priority 5 (Network) on Core 0
-  xTaskCreatePinnedToCore(networkTask, "Network", 4096, NULL, 5, NULL, 0);
-
-  // Priority 4 (Signal) on Core 1
-  xTaskCreatePinnedToCore(signalTask, "Signal", 4096, NULL, 4, NULL, 1);
+  // Network on Core 0, Signal on Core 1
+  xTaskCreatePinnedToCore(networkTask, "Net", 4096, NULL, 5, NULL, 0);
+  xTaskCreatePinnedToCore(signalTask, "Sig", 4096, NULL, 4, NULL, 1);
 }
 
 void loop()
 {
-  // Keep main thread alive
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
