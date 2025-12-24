@@ -7,7 +7,7 @@ const char *password = "gWL6vK3ztUNG";
 const char *mqtt_server = "192.168.1.2";
 const char *mqtt_topic = "home/car/command";
 
-#define SI_PIN 15 // Signal Injection Pin
+#define SI_PIN 15
 #define STATUS_LED 2
 
 // --- Shared Variables ---
@@ -25,76 +25,74 @@ void callback(char *topic, byte *payload, unsigned int length)
     memcpy(message, payload, length);
     message[length] = '\0';
     current_cmd = atoi(message);
-    Serial.print("New Command: ");
+    Serial.print("MQTT CMD: ");
     Serial.println(current_cmd);
   }
 }
 
-// --- SIGNAL GENERATION (Using your validated timing) ---
-void send_validated_signal(int cmd)
-{
-  if (cmd <= 0)
-    return;
-
-  // Disabling interrupts on this core for microsecond precision
-  portENTER_CRITICAL(&timerMux);
-
-  // 1. PREAMBLE (W2 Sequence) - Repeated 4 times
-  // Timing from your working code: LOW 1440us, HIGH 680us
-  for (int i = 0; i < 4; i++)
-  {
-    digitalWrite(SI_PIN, LOW);
-    ets_delay_us(1440);
-    digitalWrite(SI_PIN, HIGH);
-    ets_delay_us(680);
-  }
-
-  // 2. DATA COMMAND (W1 Sequence)
-  // Logic: Low 320us, High 660us (Last pulse High 460us)
-  for (int i = 0; i < cmd; i++)
-  {
-    // LOW Phase
-    digitalWrite(SI_PIN, LOW);
-    ets_delay_us(320);
-
-    // HIGH Phase
-    digitalWrite(SI_PIN, HIGH);
-    if (i < (cmd - 1))
-    {
-      ets_delay_us(660); // Normal High
-    }
-    else
-    {
-      ets_delay_us(460); // Shorter final High
-    }
-  }
-
-  // 3. Packet Gap (from your working code)
-  digitalWrite(SI_PIN, LOW);
-  ets_delay_us(100);
-
-  portEXIT_CRITICAL(&timerMux);
-}
-
-// --- CORE 1: Dedicated to Signal Timing ---
+// --- CORE 1: High-Speed Signal Generation ---
 void signalTask(void *pvParameters)
 {
   pinMode(SI_PIN, OUTPUT);
   digitalWrite(SI_PIN, LOW);
+
   for (;;)
   {
     if (current_cmd > 0)
     {
-      send_validated_signal(current_cmd);
+      int cmd_to_send = current_cmd;
+
+      // We lock the core to send a 'Burst' of packets back-to-back
+      // Sending 5 packets takes ~100ms, which keeps the RX-2C happy
+      // but is short enough not to trigger the Watchdog.
+      portENTER_CRITICAL(&timerMux);
+      for (int burst = 0; burst < 5; burst++)
+      {
+
+        // 1. PREAMBLE (W2)
+        for (int i = 0; i < 4; i++)
+        {
+          digitalWrite(SI_PIN, LOW);
+          ets_delay_us(1440);
+          digitalWrite(SI_PIN, HIGH);
+          ets_delay_us(680);
+        }
+
+        // 2. DATA (W1)
+        for (int i = 0; i < cmd_to_send; i++)
+        {
+          digitalWrite(SI_PIN, LOW);
+          ets_delay_us(320);
+          digitalWrite(SI_PIN, HIGH);
+          if (i < (cmd_to_send - 1))
+          {
+            ets_delay_us(660);
+          }
+          else
+          {
+            ets_delay_us(460); // Special short last pulse
+          }
+        }
+
+        // 3. MINIMAL GAP (Matching your simpleRC 100us)
+        digitalWrite(SI_PIN, LOW);
+        ets_delay_us(100);
+      }
+      portEXIT_CRITICAL(&timerMux);
+
+      // Yield for 1ms to let the OS background tasks run
+      vTaskDelay(1);
     }
     else
     {
-      vTaskDelay(pdMS_TO_TICKS(50)); // Idle
+      // Idle state: No pulses, ensure pin is low
+      digitalWrite(SI_PIN, LOW);
+      vTaskDelay(pdMS_TO_TICKS(50));
     }
   }
 }
 
-// --- CORE 0: Dedicated to MQTT & WiFi ---
+// --- CORE 0: Network Management ---
 void networkTask(void *pvParameters)
 {
   client.setServer(mqtt_server, 1883);
@@ -103,11 +101,9 @@ void networkTask(void *pvParameters)
   {
     if (!client.connected())
     {
-      Serial.print("Connecting MQTT...");
       String cid = "ESP32_Car_" + String(random(0xffff), HEX);
       if (client.connect(cid.c_str()))
       {
-        Serial.println("OK");
         client.subscribe(mqtt_topic);
       }
       else
@@ -130,9 +126,7 @@ void setup()
   {
     delay(500);
     digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
-    Serial.print(".");
   }
-  Serial.println("\nWiFi Ready.");
   digitalWrite(STATUS_LED, HIGH);
 
   // Network on Core 0, Signal on Core 1
