@@ -9,20 +9,22 @@ const char *mqtt_topic_cmd = "home/car/command";
 const char *mqtt_topic_s1 = "home/car/sensor1";
 const char *mqtt_topic_s2 = "home/car/sensor2";
 
-// --- Hardware Pins ---
-#define SI_PIN 15 // Car Control Signal
-#define STATUS_LED 2
+// --- RX-2C Command Codes ---
+#define CMD_FORWARD 10
+#define CMD_BACKWARD 40
 
-// Sensor 1
+// --- Hardware Pins ---
+#define SI_PIN 15
+#define STATUS_LED 2
 #define TRIG1 4
 #define ECHO1 5
-// Sensor 2
 #define TRIG2 17
 #define ECHO2 16
 
 // --- Global Variables ---
 volatile int current_cmd = 0;
-volatile bool safety_stop = false; // Flag for object detection
+volatile bool forward_blocked = false;
+volatile bool backward_blocked = false;
 float dist1 = 0, dist2 = 0;
 
 WiFiClient espClient;
@@ -38,12 +40,12 @@ void callback(char *topic, byte *payload, unsigned int length)
     memcpy(message, payload, length);
     message[length] = '\0';
     current_cmd = atoi(message);
-    Serial.print("New Command: ");
+    Serial.print("MQTT CMD: ");
     Serial.println(current_cmd);
   }
 }
 
-// --- Function to measure HC-SR04 distance ---
+// --- Distance Calculation ---
 float getDistance(int trig, int echo)
 {
   digitalWrite(trig, LOW);
@@ -51,15 +53,13 @@ float getDistance(int trig, int echo)
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
-
-  // Timeout of 25000us (approx 4 meters)
   long duration = pulseIn(echo, HIGH, 25000);
   if (duration == 0)
-    return 400.0; // Return max range if no echo
+    return 400.0;
   return (duration * 0.0343) / 2;
 }
 
-// --- CORE 1: High-Speed Signal Generation ---
+// --- CORE 1: Precision Control (Signal Generation) ---
 void signalTask(void *pvParameters)
 {
   pinMode(SI_PIN, OUTPUT);
@@ -67,11 +67,17 @@ void signalTask(void *pvParameters)
 
   for (;;)
   {
-    // Only send signal if command > 0 AND no obstacle is detected
-    if (current_cmd > 0 && !safety_stop)
+    bool allow_move = true;
+
+    // Directional Safety Check
+    if (current_cmd == CMD_FORWARD && forward_blocked)
+      allow_move = false;
+    else if (current_cmd == CMD_BACKWARD && backward_blocked)
+      allow_move = false;
+
+    if (current_cmd > 0 && allow_move)
     {
       int cmd_to_send = current_cmd;
-
       portENTER_CRITICAL(&timerMux);
       for (int burst = 0; burst < 5; burst++)
       {
@@ -108,22 +114,19 @@ void signalTask(void *pvParameters)
   }
 }
 
-// --- CORE 0: Network & Sensor Task ---
+// --- CORE 0: Network & Sensor Monitoring ---
 void sensorNetworkTask(void *pvParameters)
 {
   pinMode(TRIG1, OUTPUT);
   pinMode(ECHO1, INPUT);
   pinMode(TRIG2, OUTPUT);
   pinMode(ECHO2, INPUT);
-
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-
   unsigned long last_publish = 0;
 
   for (;;)
   {
-    // 1. MQTT Connectivity
     if (!client.connected())
     {
       String cid = "ESP32_Car_" + String(random(0xffff), HEX);
@@ -132,28 +135,23 @@ void sensorNetworkTask(void *pvParameters)
     }
     client.loop();
 
-    // 2. Measure Distances
     dist1 = getDistance(TRIG1, ECHO1);
     dist2 = getDistance(TRIG2, ECHO2);
 
-    // 3. Safety Check
-    if (dist1 < 20.0 || dist2 < 20.0)
-    {
-      if (!safety_stop)
-        Serial.println("!!! SAFETY STOP ACTIVATED !!!");
-      safety_stop = true;
-    }
-    else
-    {
-      safety_stop = false;
-    }
+    // Update blocking flags independently
+    forward_blocked = (dist1 < 20.0);
+    backward_blocked = (dist2 < 20.0);
 
-    // 4. Publish & Serial Output (Every 500ms)
     if (millis() - last_publish > 500)
     {
       last_publish = millis();
-      Serial.printf("S1: %.1f cm | S2: %.1f cm | Stop: %s\n",
-                    dist1, dist2, safety_stop ? "YES" : "NO");
+      Serial.printf("DIST Fwd(S1): %.1f cm | Back(S2): %.1f cm | Active Cmd: %d\n",
+                    dist1, dist2, current_cmd);
+
+      if (current_cmd == CMD_FORWARD && forward_blocked)
+        Serial.println(">>> FORWARD BLOCKED!");
+      if (current_cmd == CMD_BACKWARD && backward_blocked)
+        Serial.println("<<< BACKWARD BLOCKED!");
 
       char s1_str[8], s2_str[8];
       dtostrf(dist1, 1, 1, s1_str);
@@ -161,7 +159,6 @@ void sensorNetworkTask(void *pvParameters)
       client.publish(mqtt_topic_s1, s1_str);
       client.publish(mqtt_topic_s2, s2_str);
     }
-
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -170,7 +167,6 @@ void setup()
 {
   Serial.begin(115200);
   pinMode(STATUS_LED, OUTPUT);
-
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -178,11 +174,7 @@ void setup()
     digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
   }
   digitalWrite(STATUS_LED, HIGH);
-
-  // CORE 0: MQTT + Ultrasonic (Handles measurements and networking)
   xTaskCreatePinnedToCore(sensorNetworkTask, "SensNet", 8192, NULL, 5, NULL, 0);
-
-  // CORE 1: Precision Control (Handles microsecond signal only)
   xTaskCreatePinnedToCore(signalTask, "Signal", 4096, NULL, 4, NULL, 1);
 }
 
