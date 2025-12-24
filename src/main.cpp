@@ -32,40 +32,40 @@ void callback(char *topic, byte *payload, unsigned int length)
   }
 }
 
-// --- High Precision Signal Generation (Pinned to Core 1) ---
+// --- High Precision Signal Generation for RX-2C ---
 void sendCarSignal(uint8_t cmd)
 {
   if (cmd == 0)
     return;
 
-  // Disabling interrupts on THIS core for perfect timing
   portENTER_CRITICAL(&timerMux);
 
-  // 1. Sync Phase (4 cycles)
+  // 1. Start/Sync Phase: 4 Pulses of W2
+  // W2 = 1500us HIGH, 500us LOW
   for (int i = 0; i < 4; i++)
   {
-    digitalWrite(SIGNAL_PIN, LOW);
-    ets_delay_us(1200); // 400 * 3
     digitalWrite(SIGNAL_PIN, HIGH);
-    ets_delay_us(620);
+    ets_delay_us(1500);
     digitalWrite(SIGNAL_PIN, LOW);
-    ets_delay_us(320);
+    ets_delay_us(500);
   }
 
-  // 2. Data Phase
-  uint8_t pulse_count = cmd * 2;
-  bool state = true;
-  for (int i = 0; i < pulse_count; i++)
+  // 2. Data Phase: 'n' Pulses of W1
+  // W1 = 500us HIGH, 500us LOW
+  for (int i = 0; i < cmd; i++)
   {
-    digitalWrite(SIGNAL_PIN, state);
-    ets_delay_us(state ? 620 : 320);
-    state = !state;
+    digitalWrite(SIGNAL_PIN, HIGH);
+    ets_delay_us(500);
+    digitalWrite(SIGNAL_PIN, LOW);
+    ets_delay_us(500);
   }
 
-  digitalWrite(SIGNAL_PIN, LOW);
   portEXIT_CRITICAL(&timerMux);
-}
 
+  // 3. Dead Time / Blanking Period (CRITICAL)
+  // The RX-2C needs this silence to process the pulse count
+  vTaskDelay(pdMS_TO_TICKS(15));
+}
 void carSignalTask(void *pvParameters)
 {
   pinMode(SIGNAL_PIN, OUTPUT);
