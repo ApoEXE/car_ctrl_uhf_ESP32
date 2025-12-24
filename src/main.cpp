@@ -21,8 +21,8 @@
 String version = String(MAYOR) + "." + String(MINOR) + "." + String(PATCH);
 
 // WIFI PASSWORD
-#define WIFI_SSID "MIWIFI_zmiz"
-#define WIFI_PASS "3wRdPJut"
+#define WIFI_SSID "Livebox7-1EF4"
+#define WIFI_PASS "gWL6vK3ztUNG"
 
 // LED DISPLAY
 const int led1 = 2; // Pin of the LED
@@ -40,7 +40,7 @@ volatile uint32_t biggerTimeMillis = 0;
 char msg[MSG_BUFFER_SIZE];
 std::string device = "car/command";
 std::string TOPIC_IP = "home/" + device;
-const char *mqtt_server = "192.168.1.3";
+const char *mqtt_server = "192.168.1.2";
 const char *TOPIC = TOPIC_IP.c_str();
 WiFiClient espClient;
 PubSubClient client(espClient);
