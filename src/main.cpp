@@ -2,7 +2,7 @@
 #include <PubSubClient.h>
 
 // --- Network Configuration ---
-const char *ssid = "Livebox7-1EF4-WiFi7";
+const char *ssid = "Livebox7-1EF4";
 const char *password = "gWL6vK3ztUNG";
 const char *mqtt_server = "192.168.1.2";
 const char *mqtt_topic = "home/car/command";
