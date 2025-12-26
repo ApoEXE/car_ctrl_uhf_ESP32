@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <BluetoothSerial.h> // Include Bluetooth Serial library
 
 // --- Configuration ---
 const char *ssid = "Livebox7-1EF4";
@@ -29,7 +30,27 @@ float dist1 = 0, dist2 = 0;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+BluetoothSerial SerialBT; // Create Bluetooth Serial Object
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Helper: Dual Print (USB + Bluetooth) ---
+void debugPrintln(String msg)
+{
+  Serial.println(msg); // Send to USB
+  if (SerialBT.hasClient())
+  {
+    SerialBT.println(msg); // Send to Bluetooth if connected
+  }
+}
+
+void debugPrint(String msg)
+{
+  Serial.print(msg);
+  if (SerialBT.hasClient())
+  {
+    SerialBT.print(msg);
+  }
+}
 
 // --- MQTT Callback ---
 void callback(char *topic, byte *payload, unsigned int length)
@@ -40,23 +61,55 @@ void callback(char *topic, byte *payload, unsigned int length)
     memcpy(message, payload, length);
     message[length] = '\0';
     current_cmd = atoi(message);
-    Serial.print("MQTT CMD: ");
-    Serial.println(current_cmd);
+
+    String logMsg = "MQTT CMD: " + String(current_cmd);
+    debugPrintln(logMsg);
   }
 }
 
-// --- Distance Calculation ---
-float getDistance(int trig, int echo)
+// --- Distance Calculation (Helper: Single Shot) ---
+float getRawDistance(int trig, int echo)
 {
   digitalWrite(trig, LOW);
   delayMicroseconds(2);
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
+
   long duration = pulseIn(echo, HIGH, 25000);
+
   if (duration == 0)
     return 400.0;
+
   return (duration * 0.0343) / 2;
+}
+
+// --- Distance Calculation (Main: Median Filter) ---
+float getMedianDistance(int trig, int echo)
+{
+  float readings[5];
+
+  for (int i = 0; i < 5; i++)
+  {
+    readings[i] = getRawDistance(trig, echo);
+    delay(5);
+  }
+
+  // Bubble Sort
+  for (int i = 0; i < 4; i++)
+  {
+    for (int j = i + 1; j < 5; j++)
+    {
+      if (readings[i] > readings[j])
+      {
+        float temp = readings[i];
+        readings[i] = readings[j];
+        readings[j] = temp;
+      }
+    }
+  }
+
+  return readings[2];
 }
 
 // --- CORE 1: Precision Control (Signal Generation) ---
@@ -69,7 +122,6 @@ void signalTask(void *pvParameters)
   {
     bool allow_move = true;
 
-    // Directional Safety Check
     if (current_cmd == CMD_FORWARD && forward_blocked)
       allow_move = false;
     else if (current_cmd == CMD_BACKWARD && backward_blocked)
@@ -121,37 +173,52 @@ void sensorNetworkTask(void *pvParameters)
   pinMode(ECHO1, INPUT);
   pinMode(TRIG2, OUTPUT);
   pinMode(ECHO2, INPUT);
+
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
   unsigned long last_publish = 0;
 
   for (;;)
   {
+    // Handle Wi-Fi Reconnect
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      // Optional: Add WiFi reconnect logic here if needed
+      // usually WiFi.begin in setup handles auto-reconnect,
+      // but explicit checks can be added.
+    }
+
     if (!client.connected())
     {
       String cid = "ESP32_Car_" + String(random(0xffff), HEX);
       if (client.connect(cid.c_str()))
+      {
         client.subscribe(mqtt_topic_cmd);
+        debugPrintln("MQTT Reconnected");
+      }
     }
     client.loop();
 
-    dist1 = getDistance(TRIG1, ECHO1);
-    dist2 = getDistance(TRIG2, ECHO2);
+    dist1 = getMedianDistance(TRIG1, ECHO1);
+    dist2 = getMedianDistance(TRIG2, ECHO2);
 
-    // Update blocking flags independently
     forward_blocked = (dist1 < 20.0);
     backward_blocked = (dist2 < 20.0);
 
     if (millis() - last_publish > 500)
     {
       last_publish = millis();
-      Serial.printf("DIST Fwd(S1): %.1f cm | Back(S2): %.1f cm | Active Cmd: %d\n",
-                    dist1, dist2, current_cmd);
+
+      // Construct the log message
+      String logData = "DIST Fwd: " + String(dist1, 1) +
+                       " | Back: " + String(dist2, 1) +
+                       " | Cmd: " + String(current_cmd);
+      debugPrintln(logData);
 
       if (current_cmd == CMD_FORWARD && forward_blocked)
-        Serial.println(">>> FORWARD BLOCKED!");
+        debugPrintln(">>> FORWARD BLOCKED!");
       if (current_cmd == CMD_BACKWARD && backward_blocked)
-        Serial.println("<<< BACKWARD BLOCKED!");
+        debugPrintln("<<< BACKWARD BLOCKED!");
 
       char s1_str[8], s2_str[8];
       dtostrf(dist1, 1, 1, s1_str);
@@ -159,21 +226,33 @@ void sensorNetworkTask(void *pvParameters)
       client.publish(mqtt_topic_s1, s1_str);
       client.publish(mqtt_topic_s2, s2_str);
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void setup()
 {
   Serial.begin(115200);
+
+  // --- Initialize Bluetooth ---
+  SerialBT.begin("ESP32_Car_Debug"); // Bluetooth device name
+  Serial.println("Bluetooth Started! Pair with 'ESP32_Car_Debug'");
+
   pinMode(STATUS_LED, OUTPUT);
   WiFi.begin(ssid, password);
+
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
     digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    Serial.print(".");
   }
   digitalWrite(STATUS_LED, HIGH);
+  Serial.println("\nWiFi Connected");
+  Serial.println(WiFi.localIP());
+
+  // Helper tasks
   xTaskCreatePinnedToCore(sensorNetworkTask, "SensNet", 8192, NULL, 5, NULL, 0);
   xTaskCreatePinnedToCore(signalTask, "Signal", 4096, NULL, 4, NULL, 1);
 }
