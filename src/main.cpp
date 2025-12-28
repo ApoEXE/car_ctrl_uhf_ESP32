@@ -68,58 +68,59 @@ float getRawDistance(int trig, int echo)
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
 
-  // REDUCED TIMEOUT: 12000 micros is approx 200cm (2 meters).
-  // This prevents blocking the CPU for too long if signal is lost.
+  // 12000 micros is approx 200cm.
   long duration = pulseIn(echo, HIGH, 12000);
 
   if (duration == 0)
-    return 400.0; // Timeout (or too close)
+    return 400.0; // Timeout
   return (duration * 0.0343) / 2;
 }
 
-// --- Distance Calculation (Median + Anti-Starvation) ---
+// --- Distance Calculation (Improved Logic) ---
 float getFilteredDistance(int trig, int echo, float &last_valid)
 {
-  float readings[5];
+  int valid_count = 0;
+  float sum_valid = 0;
 
+  // Take 5 readings
   for (int i = 0; i < 5; i++)
   {
-    readings[i] = getRawDistance(trig, echo);
+    float val = getRawDistance(trig, echo);
 
-    // CRITICAL FIX FOR BLUETOOTH:
-    // We yield for 2ms between pings. This lets the Bluetooth/WiFi
-    // stack process data so it doesn't disconnect.
-    vTaskDelay(pdMS_TO_TICKS(2));
-  }
-
-  // Sort (Bubble Sort)
-  for (int i = 0; i < 4; i++)
-  {
-    for (int j = i + 1; j < 5; j++)
+    // Filter Logic: Only count readings that are NOT timeouts (400)
+    if (val < 390.0)
     {
-      if (readings[i] > readings[j])
-      {
-        float temp = readings[i];
-        readings[i] = readings[j];
-        readings[j] = temp;
-      }
+      sum_valid += val;
+      valid_count++;
     }
+
+    // Small delay between burst pings to clear local noise
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 
-  float median = readings[2];
+  float result;
 
-  // --- "BLIND ZONE" LOGIC ---
-  // If we read 400 (Timeout) but the last known distance was very close (< 10cm),
-  // it means we are likely physically stuck against the wall (Blind Zone).
-  // Don't report 400, report the last known small value.
-  if (median >= 390.0 && last_valid < 10.0)
+  // 1. Calculate Result based on valid readings
+  if (valid_count > 0)
+  {
+    result = sum_valid / valid_count; // Average the good readings
+  }
+  else
+  {
+    result = 400.0; // All 5 readings were timeouts
+  }
+
+  // 2. Anti-Teleportation (Blind Zone Fix)
+  // If result is 400, but we were recently < 150cm, it's a glitch.
+  // We return the old value instead of jumping to 400.
+  if (result >= 390.0 && last_valid < 150.0)
   {
     return last_valid;
   }
 
-  // Update history
-  last_valid = median;
-  return median;
+  // 3. Update history
+  last_valid = result;
+  return result;
 }
 
 // --- CORE 1: Precision Control ---
@@ -196,13 +197,23 @@ void sensorNetworkTask(void *pvParameters)
     }
     client.loop();
 
-    // Measure with the new logic
+    // --- MEASUREMENT CYCLE ---
+
+    // 1. Measure Sensor 1
     float d1 = getFilteredDistance(TRIG1, ECHO1, last_valid_dist1);
+
+    // FIX: Wait 40ms before measuring Sensor 2.
+    // This stops sound waves from Sensor 1 confusing Sensor 2.
+    vTaskDelay(pdMS_TO_TICKS(40));
+
+    // 2. Measure Sensor 2
     float d2 = getFilteredDistance(TRIG2, ECHO2, last_valid_dist2);
 
+    // Update Blocks
     forward_blocked = (d1 < 20.0);
     backward_blocked = (d2 < 20.0);
 
+    // Publish logic
     if (millis() - last_publish > 500)
     {
       last_publish = millis();
@@ -222,7 +233,7 @@ void sensorNetworkTask(void *pvParameters)
       client.publish(mqtt_topic_s2, s2_str);
     }
 
-    // Give time for Bluetooth stack to run
+    // Loop delay
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
