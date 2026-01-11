@@ -15,7 +15,7 @@ const char *mqtt_topic_s2 = "home/car/sensor2";
 const float DIST_SLOW_START = 200.0; // Distance to start slowing down (cm)
 const float DIST_STOP = 30.0;        // Distance to stop completely (cm)
 const int MAX_SPEED_DELAY = 2000;    // Max delay in ms (slower speed) when close to object
-const int BRAKE_DURATION = 1000;     // Time (ms) to reverse motors for active braking
+const int BRAKE_DURATION = 100;      // Time (ms) to reverse motors for active braking
 
 // --- RX-2C Command Codes ---
 #define CMD_FORWARD 10
