@@ -1,4 +1,4 @@
-#include <Arduino.h> // Explicitly include Arduino for PlatformIO
+#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <BluetoothSerial.h>
@@ -14,7 +14,8 @@ const char *mqtt_topic_s2 = "home/car/sensor2";
 // --- Speed & Safety Configuration ---
 const float DIST_SLOW_START = 200.0; // Distance to start slowing down (cm)
 const float DIST_STOP = 30.0;        // Distance to stop completely (cm)
-const int MAX_SPEED_DELAY = 80;      // Max delay in ms (slower speed) when close to object
+const int MAX_SPEED_DELAY = 2000;    // Max delay in ms (slower speed) when close to object
+const int BRAKE_DURATION = 1000;     // Time (ms) to reverse motors for active braking
 
 // --- RX-2C Command Codes ---
 #define CMD_FORWARD 10
@@ -32,6 +33,10 @@ const int MAX_SPEED_DELAY = 80;      // Max delay in ms (slower speed) when clos
 volatile int current_cmd = 0;
 volatile bool forward_blocked = false;
 volatile bool backward_blocked = false;
+
+// Braking State Flags (to prevent oscillation)
+bool has_braked_forward = false;
+bool has_braked_backward = false;
 
 // Variable to control speed (PWM simulation via delay)
 // 0 = Max Speed, >0 = Slowing down
@@ -66,6 +71,13 @@ void callback(char *topic, byte *payload, unsigned int length)
     message[length] = '\0';
     current_cmd = atoi(message);
     debugPrintln("MQTT CMD: " + String(current_cmd));
+
+    // If user commands stop (0) manually, reset brake flags immediately
+    if (current_cmd == 0)
+    {
+      has_braked_forward = false;
+      has_braked_backward = false;
+    }
   }
 }
 
@@ -131,7 +143,6 @@ float getFilteredDistance(int trig, int echo, float &last_valid)
 }
 
 // --- Helper: Calculate Speed Delay ---
-// Returns: 0 (Max speed) to MAX_SPEED_DELAY (Min speed)
 int calculateSpeedDelay(float distance)
 {
   if (distance >= DIST_SLOW_START)
@@ -140,21 +151,13 @@ int calculateSpeedDelay(float distance)
   }
   else if (distance <= DIST_STOP)
   {
-    return -1; // Should stop (handled by boolean flags, but -1 indicates block)
+    return -1; // Blocked zone
   }
   else
   {
-    // Equation: Linear interpolation
-    // closer to DIST_STOP = higher delay (slower)
-    // closer to DIST_SLOW_START = lower delay (faster)
-
     float range = DIST_SLOW_START - DIST_STOP;
     float position = distance - DIST_STOP;
-
-    // Normalized factor (0.0 = at stop line, 1.0 = at start of slow zone)
     float factor = position / range;
-
-    // Invert: 1.0 (far) should be 0 delay. 0.0 (close) should be MAX delay.
     return (int)((1.0 - factor) * MAX_SPEED_DELAY);
   }
 }
@@ -169,7 +172,9 @@ void signalTask(void *pvParameters)
   {
     bool allow_move = true;
 
-    // Safety Block Check
+    // Safety Block Check (Only applies if we are NOT currently active braking)
+    // The active braking logic in sensorTask will flip current_cmd,
+    // so we trust current_cmd during the brake maneuver.
     if (current_cmd == CMD_FORWARD && forward_blocked)
       allow_move = false;
     else if (current_cmd == CMD_BACKWARD && backward_blocked)
@@ -179,7 +184,6 @@ void signalTask(void *pvParameters)
     {
       int cmd_to_send = current_cmd;
 
-      // Send the signal burst
       portENTER_CRITICAL(&timerMux);
       for (int burst = 0; burst < 5; burst++)
       {
@@ -205,9 +209,7 @@ void signalTask(void *pvParameters)
       }
       portEXIT_CRITICAL(&timerMux);
 
-      // --- SPEED CONTROL ---
-      // If speed_delay is 0, we delay 1 tick (max speed).
-      // If speed_delay is high (e.g. 50ms), we wait, effectively pulsing the motor.
+      // Speed Control Delay
       if (current_speed_delay > 0)
       {
         vTaskDelay(pdMS_TO_TICKS(current_speed_delay));
@@ -257,36 +259,97 @@ void sensorNetworkTask(void *pvParameters)
     // 2. Measure Sensor 2 (Backward)
     float d2 = getFilteredDistance(TRIG2, ECHO2, last_valid_dist2);
 
-    // 3. Update Blocking Logic (Stop completely)
-    forward_blocked = (d1 <= DIST_STOP);
-    backward_blocked = (d2 <= DIST_STOP);
+    // --- ACTIVE BRAKING & BLOCKING LOGIC ---
 
-    // 4. Update Speed Logic (Proportional Slow Down)
-    int calculated_delay = 0;
-    if (current_cmd == CMD_FORWARD)
+    // Forward Logic
+    if (d1 <= DIST_STOP)
     {
-      calculated_delay = calculateSpeedDelay(d1);
+      // If we are moving Forward and haven't braked yet for this obstacle
+      if (current_cmd == CMD_FORWARD && !has_braked_forward)
+      {
+        debugPrintln(">>> STOPPING: ACTIVE BRAKING (REVERSE)!");
+
+        // 1. Force Opposite Direction
+        current_cmd = CMD_BACKWARD;
+
+        // 2. Full Power (No speed delay) to arrest momentum
+        current_speed_delay = 0;
+
+        // 3. Wait for brake duration
+        vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION));
+
+        // 4. Force Stop
+        current_cmd = 0;
+
+        // 5. Set flags
+        has_braked_forward = true;
+        forward_blocked = true;
+      }
+      else
+      {
+        // Just keep blocked if we are already stopped or tried braking
+        forward_blocked = true;
+      }
     }
-    else if (current_cmd == CMD_BACKWARD)
+    else
     {
-      calculated_delay = calculateSpeedDelay(d2);
+      // Clear flags when obstacle is gone
+      forward_blocked = false;
+      has_braked_forward = false;
     }
 
-    // Update global variable for Core 1
-    current_speed_delay = calculated_delay;
+    // Backward Logic
+    if (d2 <= DIST_STOP)
+    {
+      if (current_cmd == CMD_BACKWARD && !has_braked_backward)
+      {
+        debugPrintln("<<< STOPPING: ACTIVE BRAKING (FORWARD)!");
+        current_cmd = CMD_FORWARD;
+        current_speed_delay = 0;
+        vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION));
+        current_cmd = 0;
+        has_braked_backward = true;
+        backward_blocked = true;
+      }
+      else
+      {
+        backward_blocked = true;
+      }
+    }
+    else
+    {
+      backward_blocked = false;
+      has_braked_backward = false;
+    }
+
+    // --- SPEED CONTROL (Normal Operation) ---
+    // Only calculate speed delay if we are NOT currently blocked/braking
+    if (!forward_blocked && !backward_blocked)
+    {
+      int calculated_delay = 0;
+      if (current_cmd == CMD_FORWARD)
+      {
+        calculated_delay = calculateSpeedDelay(d1);
+      }
+      else if (current_cmd == CMD_BACKWARD)
+      {
+        calculated_delay = calculateSpeedDelay(d2);
+      }
+      current_speed_delay = calculated_delay;
+    }
 
     // Publish logic
     if (millis() - last_publish > 500)
     {
       last_publish = millis();
 
-      String logData = "D1:" + String(d1, 0) + "cm D2:" + String(d2, 0) + "cm | Delay:" + String(current_speed_delay) + "ms";
+      String logData = "D1:" + String(d1, 0) + " D2:" + String(d2, 0) + " | CMD:" + String(current_cmd);
       debugPrintln(logData);
 
-      if (current_cmd == CMD_FORWARD && forward_blocked)
-        debugPrintln(">>> BLOCKED FWD");
-      if (current_cmd == CMD_BACKWARD && backward_blocked)
-        debugPrintln("<<< BLOCKED BWD");
+      if (forward_blocked)
+        debugPrintln(">> FWD BLOCKED");
+      if (backward_blocked)
+        debugPrintln("<< BWD BLOCKED");
 
       char s1_str[8], s2_str[8];
       dtostrf(d1, 1, 1, s1_str);
