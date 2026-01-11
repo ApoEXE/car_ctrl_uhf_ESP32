@@ -15,7 +15,7 @@ const char *mqtt_topic_s2 = "home/car/sensor2";
 const float DIST_SLOW_START = 200.0; // Distance to start slowing down (cm)
 const float DIST_STOP = 30.0;        // Distance to stop completely (cm)
 const int MAX_SPEED_DELAY = 2000;    // Max delay in ms (slower speed) when close to object
-const int BRAKE_DURATION = 500;      // Time (ms) to reverse motors for active braking
+const int BRAKE_DURATION = 1000;     // Time (ms) to reverse motors for active braking
 
 // --- RX-2C Command Codes ---
 #define CMD_FORWARD 10
@@ -34,15 +34,15 @@ volatile int current_cmd = 0;
 volatile bool forward_blocked = false;
 volatile bool backward_blocked = false;
 
-// Braking State Flags (to prevent oscillation)
+// Flags for Braking Logic
 bool has_braked_forward = false;
 bool has_braked_backward = false;
+volatile bool emergency_override = false; // New flag to wake up Signal Task immediately
 
 // Variable to control speed (PWM simulation via delay)
-// 0 = Max Speed, >0 = Slowing down
 volatile int current_speed_delay = 0;
 
-// We store history to fix the "Blind Zone" 400cm glitch
+// History for Filtering
 float last_valid_dist1 = 400.0;
 float last_valid_dist2 = 400.0;
 
@@ -72,11 +72,12 @@ void callback(char *topic, byte *payload, unsigned int length)
     current_cmd = atoi(message);
     debugPrintln("MQTT CMD: " + String(current_cmd));
 
-    // If user commands stop (0) manually, reset brake flags immediately
+    // Reset brake flags on manual stop
     if (current_cmd == 0)
     {
       has_braked_forward = false;
       has_braked_backward = false;
+      emergency_override = false;
     }
   }
 }
@@ -94,7 +95,7 @@ float getRawDistance(int trig, int echo)
   long duration = pulseIn(echo, HIGH, 12000);
 
   if (duration == 0)
-    return 400.0; // Timeout
+    return 400.0;
   return (duration * 0.0343) / 2;
 }
 
@@ -104,24 +105,18 @@ float getFilteredDistance(int trig, int echo, float &last_valid)
   int valid_count = 0;
   float sum_valid = 0;
 
-  // Take 5 readings
   for (int i = 0; i < 5; i++)
   {
     float val = getRawDistance(trig, echo);
-
-    // Filter Logic: Only count readings that are NOT timeouts (400)
     if (val < 390.0)
     {
       sum_valid += val;
       valid_count++;
     }
-    // Small delay between burst pings
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 
   float result;
-
-  // 1. Calculate Result based on valid readings
   if (valid_count > 0)
   {
     result = sum_valid / valid_count;
@@ -131,13 +126,12 @@ float getFilteredDistance(int trig, int echo, float &last_valid)
     result = 400.0;
   }
 
-  // 2. Anti-Teleportation (Blind Zone Fix)
+  // Anti-Teleportation
   if (result >= 390.0 && last_valid < 150.0)
   {
     return last_valid;
   }
 
-  // 3. Update history
   last_valid = result;
   return result;
 }
@@ -146,13 +140,9 @@ float getFilteredDistance(int trig, int echo, float &last_valid)
 int calculateSpeedDelay(float distance)
 {
   if (distance >= DIST_SLOW_START)
-  {
-    return 0; // Max speed
-  }
+    return 0;
   else if (distance <= DIST_STOP)
-  {
-    return -1; // Blocked zone
-  }
+    return -1;
   else
   {
     float range = DIST_SLOW_START - DIST_STOP;
@@ -162,7 +152,7 @@ int calculateSpeedDelay(float distance)
   }
 }
 
-// --- CORE 1: Precision Control ---
+// --- CORE 1: Precision Control (Signal Generator) ---
 void signalTask(void *pvParameters)
 {
   pinMode(SI_PIN, OUTPUT);
@@ -172,18 +162,20 @@ void signalTask(void *pvParameters)
   {
     bool allow_move = true;
 
-    // Safety Block Check (Only applies if we are NOT currently active braking)
-    // The active braking logic in sensorTask will flip current_cmd,
-    // so we trust current_cmd during the brake maneuver.
-    if (current_cmd == CMD_FORWARD && forward_blocked)
-      allow_move = false;
-    else if (current_cmd == CMD_BACKWARD && backward_blocked)
-      allow_move = false;
+    // Standard Safety Check (ignored if emergency override is active)
+    if (!emergency_override)
+    {
+      if (current_cmd == CMD_FORWARD && forward_blocked)
+        allow_move = false;
+      else if (current_cmd == CMD_BACKWARD && backward_blocked)
+        allow_move = false;
+    }
 
     if (current_cmd > 0 && allow_move)
     {
       int cmd_to_send = current_cmd;
 
+      // Critical Timing Section
       portENTER_CRITICAL(&timerMux);
       for (int burst = 0; burst < 5; burst++)
       {
@@ -209,14 +201,25 @@ void signalTask(void *pvParameters)
       }
       portEXIT_CRITICAL(&timerMux);
 
-      // Speed Control Delay
+      // --- IMPROVED DELAY LOGIC ---
+      // Instead of one long sleep, sleep in small 10ms chunks.
+      // If emergency_override triggers, we break immediately to handle the Stop/Reverse.
       if (current_speed_delay > 0)
       {
-        vTaskDelay(pdMS_TO_TICKS(current_speed_delay));
+        int remaining_time = current_speed_delay;
+        while (remaining_time > 0)
+        {
+          if (emergency_override)
+          {
+            break; // Abort delay immediately!
+          }
+          vTaskDelay(pdMS_TO_TICKS(10));
+          remaining_time -= 10;
+        }
       }
       else
       {
-        vTaskDelay(1);
+        vTaskDelay(1); // Max speed
       }
     }
     else
@@ -254,77 +257,63 @@ void sensorNetworkTask(void *pvParameters)
     // 1. Measure Sensor 1 (Forward)
     float d1 = getFilteredDistance(TRIG1, ECHO1, last_valid_dist1);
 
+    // --- FAST REACTION LOGIC (Forward) ---
+    // If moving forward and too close, BRAKE IMMEDIATELY.
+    // Do not wait for Sensor 2 or cross-talk delay.
+    if (d1 <= DIST_STOP && current_cmd == CMD_FORWARD && !has_braked_forward)
+    {
+      debugPrintln(">>> PANIC STOP: FORWARD -> REVERSE");
+
+      emergency_override = true;  // 1. Wake up signal task
+      current_speed_delay = 0;    // 2. Max Power
+      current_cmd = CMD_BACKWARD; // 3. Reverse
+
+      vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION)); // Hold reverse
+
+      current_cmd = 0;            // 4. Stop
+      emergency_override = false; // 5. Resume normal safety checks
+
+      has_braked_forward = true;
+      forward_blocked = true;
+      continue; // Restart loop, skip Sensor 2 for now
+    }
+
+    // Normal operation: Update blocking status
+    forward_blocked = (d1 <= DIST_STOP);
+    if (!forward_blocked)
+      has_braked_forward = false;
+
+    // Cross-talk delay (Only if we didn't panic brake)
     vTaskDelay(pdMS_TO_TICKS(40));
 
     // 2. Measure Sensor 2 (Backward)
     float d2 = getFilteredDistance(TRIG2, ECHO2, last_valid_dist2);
 
-    // --- ACTIVE BRAKING & BLOCKING LOGIC ---
-
-    // Forward Logic
-    if (d1 <= DIST_STOP)
+    // --- FAST REACTION LOGIC (Backward) ---
+    if (d2 <= DIST_STOP && current_cmd == CMD_BACKWARD && !has_braked_backward)
     {
-      // If we are moving Forward and haven't braked yet for this obstacle
-      if (current_cmd == CMD_FORWARD && !has_braked_forward)
-      {
-        debugPrintln(">>> STOPPING: ACTIVE BRAKING (REVERSE)!");
+      debugPrintln("<<< PANIC STOP: BACKWARD -> FORWARD");
 
-        // 1. Force Opposite Direction
-        current_cmd = CMD_BACKWARD;
+      emergency_override = true;
+      current_speed_delay = 0;
+      current_cmd = CMD_FORWARD;
 
-        // 2. Full Power (No speed delay) to arrest momentum
-        current_speed_delay = 0;
+      vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION));
 
-        // 3. Wait for brake duration
-        vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION));
+      current_cmd = 0;
+      emergency_override = false;
 
-        // 4. Force Stop
-        current_cmd = 0;
-
-        // 5. Set flags
-        has_braked_forward = true;
-        forward_blocked = true;
-      }
-      else
-      {
-        // Just keep blocked if we are already stopped or tried braking
-        forward_blocked = true;
-      }
-    }
-    else
-    {
-      // Clear flags when obstacle is gone
-      forward_blocked = false;
-      has_braked_forward = false;
+      has_braked_backward = true;
+      backward_blocked = true;
+      continue;
     }
 
-    // Backward Logic
-    if (d2 <= DIST_STOP)
-    {
-      if (current_cmd == CMD_BACKWARD && !has_braked_backward)
-      {
-        debugPrintln("<<< STOPPING: ACTIVE BRAKING (FORWARD)!");
-        current_cmd = CMD_FORWARD;
-        current_speed_delay = 0;
-        vTaskDelay(pdMS_TO_TICKS(BRAKE_DURATION));
-        current_cmd = 0;
-        has_braked_backward = true;
-        backward_blocked = true;
-      }
-      else
-      {
-        backward_blocked = true;
-      }
-    }
-    else
-    {
-      backward_blocked = false;
+    backward_blocked = (d2 <= DIST_STOP);
+    if (!backward_blocked)
       has_braked_backward = false;
-    }
 
-    // --- SPEED CONTROL (Normal Operation) ---
-    // Only calculate speed delay if we are NOT currently blocked/braking
-    if (!forward_blocked && !backward_blocked)
+    // --- SPEED CONTROL CALCULATION ---
+    if (!forward_blocked && !backward_blocked && !emergency_override)
     {
       int calculated_delay = 0;
       if (current_cmd == CMD_FORWARD)
@@ -342,14 +331,8 @@ void sensorNetworkTask(void *pvParameters)
     if (millis() - last_publish > 500)
     {
       last_publish = millis();
-
-      String logData = "D1:" + String(d1, 0) + " D2:" + String(d2, 0) + " | CMD:" + String(current_cmd);
+      String logData = "D1:" + String(d1, 0) + " D2:" + String(d2, 0) + " | CMD:" + String(current_cmd) + " | DLY:" + String(current_speed_delay);
       debugPrintln(logData);
-
-      if (forward_blocked)
-        debugPrintln(">> FWD BLOCKED");
-      if (backward_blocked)
-        debugPrintln("<< BWD BLOCKED");
 
       char s1_str[8], s2_str[8];
       dtostrf(d1, 1, 1, s1_str);
